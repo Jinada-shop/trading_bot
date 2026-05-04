@@ -24,16 +24,14 @@ ALLOWED_USERS = [int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-# ========== 40 ТОРГОВЫХ ПАР ==========
+# ========== 30 ТОРГОВЫХ ПАР ==========
 SYMBOLS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
     "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "DOT/USDT", "MATIC/USDT",
     "LINK/USDT", "LTC/USDT", "NEAR/USDT", "ATOM/USDT", "UNI/USDT",
     "OP/USDT", "ARB/USDT", "APT/USDT", "SUI/USDT", "INJ/USDT",
-    "SEI/USDT", "TIA/USDT", "ALT/USDT", "FET/USDT", "RNDR/USDT",
-    "AGIX/USDT", "OCEAN/USDT", "WLD/USDT", "JUP/USDT", "ENA/USDT",
-    "ETHFI/USDT", "PENDLE/USDT", "LDO/USDT", "PEPE/USDT", "WIF/USDT",
-    "GALA/USDT", "SAND/USDT", "MANA/USDT", "AXS/USDT", "ENJ/USDT"
+    "FET/USDT", "RNDR/USDT", "WLD/USDT", "JUP/USDT", "ENA/USDT",
+    "PEPE/USDT", "WIF/USDT", "GALA/USDT", "SAND/USDT", "MANA/USDT"
 ]
 
 MIN_CONFIDENCE = 0.60
@@ -343,7 +341,7 @@ async def send_report(context):
             emoji = "🟢" if p['buy_count'] > p['sell_count'] else "🔴"
             report += f"{i+1}. *{p['symbol']}* — {emoji} {p['max_conf']:.0%} (средняя {p['avg_conf']:.0%})\n"
     else:
-        report += "⚠️ *ЗА 10 МИНУТ НЕТ СИГНАЛОВ*\nРынок во флете, жди движения.\n"
+        report += "⚠️ *ЗА 10 МИНУТ НЕТ СИГНАЛОВ*\n"
     
     report += "\n💰 *ТЕКУЩИЕ ЦЕНЫ:*\n"
     try:
@@ -366,7 +364,7 @@ async def all_signals(uid, context):
         return
     all_sig = model.predict_all()
     if not all_sig:
-        await safe_edit(uid, context, "📊 *НЕТ СИЛЬНЫХ СИГНАЛОВ*", get_panel(uid))
+        await safe_edit(uid, context, "📊 *НЕТ СИГНАЛОВ*", get_panel(uid))
         return
     text = "📊 *ВСЕ СИГНАЛЫ*\n\n"
     for sig in all_sig[:15]:
@@ -380,7 +378,7 @@ async def top_buy_signals(uid, context):
     all_sig = model.predict_all()
     buy = [s for s in all_sig if "ПОКУПАТЬ" in s['action']]
     if not buy:
-        await safe_edit(uid, context, "📊 *НЕТ СИГНАЛОВ НА ПОКУПКУ*", get_panel(uid))
+        await safe_edit(uid, context, "📊 *НЕТ СИГНАЛОВ*", get_panel(uid))
         return
     text = "🏆 *ТОП-5 ПОКУПКА*\n\n"
     for i, sig in enumerate(buy[:5]):
@@ -394,7 +392,7 @@ async def top_sell_signals(uid, context):
     all_sig = model.predict_all()
     sell = [s for s in all_sig if "ПРОДАВАТЬ" in s['action']]
     if not sell:
-        await safe_edit(uid, context, "📊 *НЕТ СИГНАЛОВ НА ПРОДАЖУ*", get_panel(uid))
+        await safe_edit(uid, context, "📊 *НЕТ СИГНАЛОВ*", get_panel(uid))
         return
     text = "🏆 *ТОП-5 ПРОДАЖА*\n\n"
     for i, sig in enumerate(sell[:5]):
@@ -429,7 +427,7 @@ async def handler(update, context):
     data = query.data
     
     if data == "main":
-        await safe_edit(uid, context, f"🧠 *ГЛАВНОЕ МЕНЮ*\n💰 Баланс: ${get_balance(uid):.0f}", get_panel(uid))
+        await safe_edit(uid, context, f"🧠 *МЕНЮ*\n💰 Баланс: ${get_balance(uid):.0f}", get_panel(uid))
     elif data == "all_signals":
         await all_signals(uid, context)
     elif data == "top_buy":
@@ -472,15 +470,7 @@ async def handler(update, context):
         except:
             pass
     elif data == "help":
-        await safe_edit(uid, context,
-            "📖 *ИНСТРУКЦИЯ*\n\n"
-            "1️⃣ **ОБУЧИТЬ** — нажми один раз (3-5 минут)\n"
-            "2️⃣ **СИГНАЛ ПО ВСЕМ** — все сигналы\n"
-            "3️⃣ **ТОП 5** — лучшие монеты\n\n"
-            "📡 Сигналы каждую минуту!\n"
-            "📈 Отчёт каждые 10 минут!\n\n"
-            "⚠️ Начинай с малых сумм!",
-            get_panel(uid))
+        await safe_edit(uid, context, "📖 *ИНСТРУКЦИЯ*\n\n1️⃣ ОБУЧИТЬ (1 раз)\n2️⃣ СИГНАЛ ПО ВСЕМ\n3️⃣ ТОП 5\n\n📡 Сигналы каждую минуту!", get_panel(uid))
 
 async def text_input(update, context):
     uid = update.effective_user.id
@@ -553,10 +543,9 @@ def main():
         app.job_queue.run_repeating(send_report, interval=REPORT_INTERVAL, first=15)
     
     print("="*70)
-    print(f"🧠 УМНЫЙ ТОРГОВЫЙ БОТ ЗАПУЩЕН")
-    print(f"📊 Анализируется {len(SYMBOLS)} торговых пар")
+    print(f"🧠 БОТ ЗАПУЩЕН | {len(SYMBOLS)} пар")
     print("="*70)
     app.run_polling()
 
 if __name__ == "__main__":
-    main() 
+    main()
