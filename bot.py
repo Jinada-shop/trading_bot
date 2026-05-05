@@ -5,14 +5,14 @@ import numpy as np
 import pandas as pd
 import asyncio
 from datetime import datetime, timedelta
-from collections import defaultdict
+from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import ccxt
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score
 import joblib
+from threading import Thread
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -21,142 +21,119 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USERS = [int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()]
 
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-
-# ========== 30 ТОРГОВЫХ ПАР ==========
-SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
-    "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "DOT/USDT", "MATIC/USDT",
-    "LINK/USDT", "LTC/USDT", "NEAR/USDT", "ATOM/USDT", "UNI/USDT",
-    "OP/USDT", "ARB/USDT", "APT/USDT", "SUI/USDT", "INJ/USDT",
-    "FET/USDT", "RNDR/USDT", "WLD/USDT", "JUP/USDT", "ENA/USDT",
-    "PEPE/USDT", "WIF/USDT", "GALA/USDT", "SAND/USDT", "MANA/USDT"
-]
-
-MIN_CONFIDENCE = 0.60
-CHECK_INTERVAL = 60
-REPORT_INTERVAL = 600
+SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+TIMEFRAME = "1h"
+MIN_CONFIDENCE = 0.6
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Подключение к Binance
-if BINANCE_API_KEY and BINANCE_API_SECRET:
-    exchange = ccxt.binance({
-        'apiKey': BINANCE_API_KEY,
-        'secret': BINANCE_API_SECRET,
-        'enableRateLimit': True,
-        'options': {'defaultType': 'spot'}
-    })
-    print(f"✅ Binance подключён | {len(SYMBOLS)} пар")
-else:
-    exchange = ccxt.binance({'enableRateLimit': True})
-    print(f"⚙️ Binance: только сигналы | {len(SYMBOLS)} пар")
+exchange = ccxt.binance({"enableRateLimit": True})
 
-# ========== ДАННЫЕ ==========
-user_balance = {}
-user_auto = {}
-user_trades = {}
-user_messages = {}
-signal_history = defaultdict(list)
+# ========== БАЛАНС ПОЛЬЗОВАТЕЛЯ ==========
+user_balances = {}
 
-def load_data():
-    for f, d in [("balance.json", user_balance), ("auto.json", user_auto), ("trades.json", user_trades)]:
-        if os.path.exists(f):
-            with open(f, "r") as file:
-                d.update(json.load(file))
+def get_balance(user_id):
+    return user_balances.get(str(user_id), 1000)
 
-def save_data():
-    with open("balance.json", "w") as f: json.dump(user_balance, f)
-    with open("auto.json", "w") as f: json.dump(user_auto, f)
-    with open("trades.json", "w") as f: json.dump(user_trades, f)
+def set_balance(user_id, amount):
+    user_balances[str(user_id)] = amount
 
-def get_balance(uid): return user_balance.get(str(uid), 500)
-def set_balance(uid, amt): user_balance[str(uid)] = max(0, amt); save_data()
-def add_balance(uid, amt): set_balance(uid, get_balance(uid) + amt)
-def sub_balance(uid, amt):
-    if get_balance(uid) >= amt:
-        set_balance(uid, get_balance(uid) - amt)
+def add_balance(user_id, amount):
+    new = get_balance(user_id) + amount
+    set_balance(user_id, new)
+    return new
+
+def subtract_balance(user_id, amount):
+    current = get_balance(user_id)
+    if current >= amount:
+        set_balance(user_id, current - amount)
         return True
     return False
 
-def get_auto(uid):
-    uid = str(uid)
-    if uid not in user_auto:
-        user_auto[uid] = {
-            'enabled': False, 'pos_size': 20, 'stop_loss': 5, 'take_profit': 10,
-            'trades_today': 0, 'daily_loss': 0, 'last_date': datetime.now().strftime("%Y-%m-%d")
+# ========== АВТОТОРГОВЛЯ ==========
+def get_default_autotrade():
+    return {
+        'enabled': False,
+        'mode': 'signal_only',
+        'max_trades_per_day': 5,
+        'max_daily_loss': 10,
+        'cooldown_minutes': 30,
+        'position': None,
+        'entry_price': 0,
+        'trades_today': 0,
+        'daily_loss': 0,
+        'last_trade_time': None
+    }
+
+autotrade_settings = {}
+
+def get_autotrade(user_id):
+    uid = str(user_id)
+    if uid not in autotrade_settings:
+        autotrade_settings[uid] = get_default_autotrade()
+    return autotrade_settings[uid]
+
+# ========== РЕКОМЕНДАЦИИ ПО БЮДЖЕТУ ==========
+def get_budget_recommendations(balance_usdt):
+    if balance_usdt < 100:
+        return {
+            'level': '🟢 Начинающий',
+            'advice': 'Торгуйте аккуратно',
+            'position_percent': 15,
+            'max_position_usdt': balance_usdt * 0.15,
+            'stop_loss_percent': 7,
+            'take_profit_percent': 12,
+            'recommended_symbols': ['BTC/USDT'],
+            'warning': '⚠️ Не рискуйте больше чем готовы потерять!'
         }
-    return user_auto[uid]
+    elif balance_usdt < 500:
+        return {
+            'level': '🟡 Средний',
+            'advice': 'Можно торговать активнее',
+            'position_percent': 8,
+            'max_position_usdt': balance_usdt * 0.08,
+            'stop_loss_percent': 6,
+            'take_profit_percent': 12,
+            'recommended_symbols': ['BTC/USDT', 'ETH/USDT'],
+            'warning': '✅ Не забывайте про стоп-лоссы'
+        }
+    elif balance_usdt < 2000:
+        return {
+            'level': '🟠 Продвинутый',
+            'advice': 'Диверсифицируйте портфель',
+            'position_percent': 5,
+            'max_position_usdt': balance_usdt * 0.05,
+            'stop_loss_percent': 5,
+            'take_profit_percent': 10,
+            'recommended_symbols': ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'],
+            'warning': '📊 Используйте автоторговлю с осторожностью'
+        }
+    else:
+        return {
+            'level': '🔴 Профессиональный',
+            'advice': 'Можете использовать сложные стратегии',
+            'position_percent': 3,
+            'max_position_usdt': balance_usdt * 0.03,
+            'stop_loss_percent': 4,
+            'take_profit_percent': 8,
+            'recommended_symbols': ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT'],
+            'warning': '🎯 Используйте трейлинг стоп'
+        }
 
-# ========== ПАНЕЛЬ ==========
-def get_panel(uid):
-    auto = get_auto(uid)
-    balance = get_balance(uid)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"💰 {balance:.0f} USDT", callback_data="show_balance"),
-         InlineKeyboardButton(f"🔘 АВТО: {'✅' if auto['enabled'] else '❌'}", callback_data="toggle")],
-        [InlineKeyboardButton("📈 СИГНАЛ ПО ВСЕМ", callback_data="all_signals")],
-        [InlineKeyboardButton("🏆 ТОП 5 (ПОКУПКА)", callback_data="top_buy"),
-         InlineKeyboardButton("🏆 ТОП 5 (ПРОДАЖА)", callback_data="top_sell")],
-        [InlineKeyboardButton("🧠 ОБУЧИТЬ", callback_data="train"),
-         InlineKeyboardButton("⚙️ НАСТРОЙКИ", callback_data="settings")],
-        [InlineKeyboardButton("📊 СТАТИСТИКА", callback_data="stats"),
-         InlineKeyboardButton("📖 ПОМОЩЬ", callback_data="help")],
-    ])
+def get_signal_strength(prediction, confidence):
+    if prediction is None:
+        return "Недостаточно данных"
+    if prediction == 1 and confidence > 0.7:
+        return "🟢 СИЛЬНЫЙ СИГНАЛ"
+    elif prediction == 1 and confidence > 0.6:
+        return "🟡 СРЕДНИЙ СИГНАЛ"
+    elif prediction == 0 and confidence > 0.6:
+        return "🔴 СИГНАЛ НА ЗАКРЫТИЕ"
+    else:
+        return "⚪ НЕТ СИГНАЛА"
 
-def get_settings_panel(uid):
-    auto = get_auto(uid)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"💰 Бюджет: ${get_balance(uid):.0f}", callback_data="set_budget")],
-        [InlineKeyboardButton(f"📊 Позиция: ${auto['pos_size']:.0f}", callback_data="set_pos")],
-        [InlineKeyboardButton(f"🛡️ Стоп: {auto['stop_loss']}%", callback_data="set_sl"),
-         InlineKeyboardButton(f"🎯 Профит: {auto['take_profit']}%", callback_data="set_tp")],
-        [InlineKeyboardButton("◀️ НАЗАД", callback_data="main")],
-    ])
-
-async def safe_edit(chat_id, context, text, panel):
-    try:
-        if str(chat_id) in user_messages:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=user_messages[str(chat_id)])
-            except:
-                pass
-        msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=panel, parse_mode='Markdown')
-        user_messages[str(chat_id)] = msg.message_id
-    except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
-
-# ========== АНАЛИЗАТОР ==========
-class Analyzer:
-    @staticmethod
-    def rsi(prices, period=14):
-        if len(prices) < period + 1: return 50
-        delta = np.diff(prices)
-        gain = np.where(delta > 0, delta, 0)
-        loss = np.where(delta < 0, -delta, 0)
-        ag = np.mean(gain[-period:])
-        al = np.mean(loss[-period:])
-        if al == 0: return 100
-        return 100 - (100 / (1 + ag / al))
-    
-    @staticmethod
-    def extract_features(df):
-        closes = df['close'].values
-        features = []
-        for i in range(50, len(df)):
-            w = closes[i-50:i]
-            r = Analyzer.rsi(w, 14)
-            s7 = np.mean(w[-7:])
-            s25 = np.mean(w[-25:])
-            pc = (closes[i] - closes[i-1]) / closes[i-1] if closes[i-1] > 0 else 0
-            vol = np.std(w[-20:]) / np.mean(w[-20:]) if np.mean(w[-20:]) > 0 else 0.01
-            trend = (s7 / s25 - 1) if s25 > 0 else 0
-            features.append([r/100, trend, pc, vol])
-        return np.array(features) if len(features) > 50 else None
-
-# ========== МОДЕЛЬ ==========
+# ========== КЛАСС МОДЕЛИ ==========
 class TradingModel:
     def __init__(self):
         self.models = {}
@@ -164,388 +141,480 @@ class TradingModel:
         self.is_trained = False
         self.load()
     
-    def train(self, symbols=None):
-        if symbols is None:
-            symbols = SYMBOLS
+    def calculate_rsi(self, prices, period=14):
+        if len(prices) < period + 1:
+            return 50
+        delta = np.diff(prices)
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        avg_gain = np.mean(gain[-period:])
+        avg_loss = np.mean(loss[-period:])
+        if avg_loss == 0:
+            return 100
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+    
+    def get_features(self, closes):
+        features = []
+        for i in range(50, len(closes)):
+            window = closes[i-50:i]
+            rsi = self.calculate_rsi(window)
+            sma7 = np.mean(window[-7:])
+            sma25 = np.mean(window[-25:])
+            price_change = (window[-1] - window[-2]) / window[-2] if len(window) > 1 else 0
+            volatility = np.std(window[-20:]) / np.mean(window[-20:]) if np.mean(window[-20:]) > 0 else 0.01
+            features.append([rsi, sma7/sma25 - 1, price_change, volatility, window[-1]])
+        return features
+    
+    def prepare_data(self, symbol, limit=600):
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
+            closes = [c[4] for c in ohlcv]
+            features = self.get_features(closes)
+            if len(features) < 100:
+                return None, None
+            X, y = [], []
+            for i in range(len(features) - 6):
+                X.append(features[i][:4])
+                y.append(1 if features[i+6][4] > features[i][4] else 0)
+            return np.array(X), np.array(y)
+        except Exception as e:
+            logger.error(f"Ошибка {symbol}: {e}")
+            return None, None
+    
+    def train(self, symbol=None):
+        syms = [symbol] if symbol else SYMBOLS
         results = {}
-        total = len(symbols)
-        for idx, sym in enumerate(symbols):
-            try:
-                logger.info(f"Обучение {idx+1}/{total}: {sym}")
-                ohlcv = exchange.fetch_ohlcv(sym, "1h", limit=300)
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                feat = Analyzer.extract_features(df)
-                if feat is None: 
-                    results[sym] = {"error": "Недостаточно данных"}
-                    continue
-                closes = df['close'].values
-                X = feat[:-6]
-                y = [1 if closes[i+6+50] > closes[i+50] else 0 for i in range(len(feat)-6)]
-                y = np.array(y)
-                X = X[:len(y)]
-                scaler = StandardScaler()
-                Xs = scaler.fit_transform(X)
-                model = XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, use_label_encoder=False, eval_metric='logloss')
-                model.fit(Xs, y)
-                acc = accuracy_score(y, model.predict(Xs))
-                self.models[sym] = model
-                self.scalers[sym] = scaler
-                results[sym] = {"accuracy": acc, "samples": len(X)}
-                logger.info(f"✅ {sym}: {acc:.1%}")
-            except Exception as e:
-                results[sym] = {"error": str(e)}
+        for sym in syms:
+            X, y = self.prepare_data(sym)
+            if X is None or len(X) < 50:
+                results[sym] = {"error": "Недостаточно данных"}
+                continue
+            scaler = StandardScaler()
+            Xs = scaler.fit_transform(X)
+            model = XGBClassifier(n_estimators=50, max_depth=4, learning_rate=0.1, random_state=42, use_label_encoder=False, eval_metric="logloss")
+            model.fit(Xs, y)
+            acc = np.mean(model.predict(Xs) == y)
+            self.models[sym] = model
+            self.scalers[sym] = scaler
+            results[sym] = {"accuracy": acc, "samples": len(X)}
+            logger.info(f"{sym}: {acc:.2%}")
         self.is_trained = True
         self.save()
         return results
     
     def predict(self, symbol):
         if not self.is_trained or symbol not in self.models:
-            return None, 0.5, "⚪"
+            return None, 0.5, {}
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, "1h", limit=100)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            feat = Analyzer.extract_features(df)
-            if feat is None or len(feat) == 0:
-                return None, 0.5, "⚪"
-            Xc = feat[-1:].reshape(1, -1)
-            Xs = self.scalers[symbol].transform(Xc)
+            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
+            closes = [c[4] for c in ohlcv]
+            rsi = self.calculate_rsi(closes[-50:])
+            sma7 = np.mean(closes[-7:])
+            sma25 = np.mean(closes[-25:])
+            price_change = (closes[-1] - closes[-2]) / closes[-2]
+            volatility = np.std(closes[-20:]) / np.mean(closes[-20:]) if np.mean(closes[-20:]) > 0 else 0.01
+            features = np.array([[rsi, sma7/sma25 - 1, price_change, volatility]])
+            Xs = self.scalers[symbol].transform(features)
             proba = self.models[symbol].predict_proba(Xs)[0]
             pred = self.models[symbol].predict(Xs)[0]
-            conf = max(proba)
-            if conf > 0.75: strength = "🟢"
-            elif conf > 0.65: strength = "🟡"
-            else: strength = "⚪"
-            return pred, conf, strength
-        except:
-            return None, 0.5, "⚪"
-    
-    def predict_all(self):
-        results = []
-        for sym in SYMBOLS:
-            pred, conf, strength = self.predict(sym)
-            if pred is not None and conf > MIN_CONFIDENCE:
-                name = sym.replace("/USDT", "")
-                results.append({
-                    'symbol': name,
-                    'action': '🟢 ПОКУПАТЬ' if pred == 1 else '🔴 ПРОДАВАТЬ',
-                    'confidence': conf,
-                    'strength': strength
-                })
-        return sorted(results, key=lambda x: x['confidence'], reverse=True)
+            levels = {
+                'stop_loss': closes[-1] * 0.95,
+                'take_profit': closes[-1] * 1.10,
+                'support': np.min(closes[-20:]),
+                'resistance': np.max(closes[-20:])
+            }
+            risk = "🟢 Низкий" if rsi < 70 and rsi > 30 else "🟡 Средний" if rsi < 80 and rsi > 20 else "🔴 Высокий"
+            return pred, max(proba), {'rsi': rsi, 'levels': levels, 'risk': risk}
+        except Exception as e:
+            logger.error(f"Ошибка {symbol}: {e}")
+            return None, 0.5, {}
     
     def save(self):
         for sym, model in self.models.items():
             safe = sym.replace("/", "_")
-            joblib.dump((model, self.scalers[sym]), f"model_{safe}.pkl")
+            joblib.dump(model, f"model_{safe}.pkl")
+            joblib.dump(self.scalers[sym], f"scaler_{safe}.pkl")
     
     def load(self):
         for sym in SYMBOLS:
             safe = sym.replace("/", "_")
             if os.path.exists(f"model_{safe}.pkl"):
-                try:
-                    data = joblib.load(f"model_{safe}.pkl")
-                    if isinstance(data, tuple) and len(data) == 2:
-                        self.models[sym], self.scalers[sym] = data
-                    self.is_trained = True
-                except:
-                    pass
-        logger.info(f"Загружено моделей: {len(self.models)}/{len(SYMBOLS)}")
+                self.models[sym] = joblib.load(f"model_{safe}.pkl")
+                self.scalers[sym] = joblib.load(f"scaler_{safe}.pkl")
+                self.is_trained = True
+                logger.info(f"Загружена {sym}")
 
 model = TradingModel()
 
-# ========== СИГНАЛЫ ==========
-async def send_signal(uid, context, symbol, pred, conf, price):
-    name = symbol.replace("/USDT", "")
-    if pred == 1:
-        text = f"🚨 *{name}* — 🟢 **ПОКУПАЙ!**\n💰 ${price:,.0f}\n🎯 Уверенность: {conf:.0%}"
-    else:
-        text = f"🚨 *{name}* — 🔴 **ПРОДАВАЙ!**\n💰 ${price:,.0f}\n🎯 Уверенность: {conf:.0%}"
-    await context.bot.send_message(chat_id=uid, text=text, parse_mode='Markdown')
+# ========== КЛАВИАТУРЫ ==========
+def get_main_keyboard(user_id):
+    balance = get_balance(user_id)
+    auto = get_autotrade(user_id)
+    auto_status = "✅ Вкл" if auto['enabled'] else "❌ Выкл"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"💰 Баланс: ${balance:.2f}", callback_data="balance")],
+        [InlineKeyboardButton("📊 Рекомендации по бюджету", callback_data="budget")],
+        [InlineKeyboardButton("📈 Сигнал (BTC)", callback_data="signal_BTC/USDT"),
+         InlineKeyboardButton("📈 Сигнал (ETH)", callback_data="signal_ETH/USDT")],
+        [InlineKeyboardButton("📈 Сигнал (SOL)", callback_data="signal_SOL/USDT"),
+         InlineKeyboardButton("📈 Сигнал (BNB)", callback_data="signal_BNB/USDT")],
+        [InlineKeyboardButton("🧠 Обучить модель", callback_data="train")],
+        [InlineKeyboardButton(f"🤖 Автоторговля: {auto_status}", callback_data="autotrade")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+         InlineKeyboardButton("💬 Советы", callback_data="tips")],
+    ])
 
-async def check_markets(context):
-    if not model.is_trained:
-        return
+def get_autotrade_keyboard(user_id):
+    at = get_autotrade(user_id)
+    status = "✅ Вкл" if at['enabled'] else "❌ Выкл"
+    mode = at['mode'].replace('_', ' ').title()
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🔘 Вкл/Выкл: {status}", callback_data="at_toggle")],
+        [InlineKeyboardButton(f"📊 Режим: {mode}", callback_data="at_mode")],
+        [InlineKeyboardButton(f"💰 Лимит сделок: {at['max_trades_per_day']}/день", callback_data="at_limit_trades")],
+        [InlineKeyboardButton(f"📉 Лимит убытка: {at['max_daily_loss']}%", callback_data="at_limit_loss")],
+        [InlineKeyboardButton(f"⏱️ Кулдаун: {at['cooldown_minutes']} мин", callback_data="at_cooldown")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back")],
+    ])
+
+# ========== ОТПРАВКА СИГНАЛОВ ==========
+async def send_signal_to_user(context, user_id, symbol, prediction, confidence, info, price):
+    balance = get_balance(user_id)
+    budget_rec = get_budget_recommendations(balance)
+    strength = get_signal_strength(prediction, confidence)
     
-    for uid in ALLOWED_USERS:
-        best_signals = []
-        for sym in SYMBOLS:
-            try:
-                pred, conf, strength = model.predict(sym)
-                if pred is not None and conf > MIN_CONFIDENCE:
+    if prediction == 1 and confidence > MIN_CONFIDENCE:
+        text = (
+            f"🚨 *{symbol} — СИГНАЛ НА ПОКУПКУ!*\n\n"
+            f"🟢 *КУПИТЬ*\n"
+            f"💰 Цена: ${price:,.0f}\n"
+            f"🎯 Уверенность: {confidence:.1%}\n"
+            f"📊 RSI: {info.get('rsi', 50):.1f}\n"
+            f"⚠️ Риск: {info.get('risk', 'Н/Д')}\n\n"
+            f"*Уровни:*\n"
+            f"🛑 Стоп-лосс: ${info.get('levels', {}).get('stop_loss', 0):,.0f} (-{budget_rec['stop_loss_percent']}%)\n"
+            f"🎯 Тейк-профит: ${info.get('levels', {}).get('take_profit', 0):,.0f} (+{budget_rec['take_profit_percent']}%)\n\n"
+            f"*💰 По вашему бюджету (${balance:.2f}):*\n"
+            f"• Рекомендованная позиция: **${budget_rec['max_position_usdt']:.2f}**\n"
+            f"• {strength}\n\n"
+            f"💡 {budget_rec['advice']}"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🟢 Купить", callback_data=f"buy_{symbol}_{price}")]])
+    elif prediction == 0 and confidence > MIN_CONFIDENCE:
+        text = (
+            f"🚨 *{symbol} — СИГНАЛ НА ПРОДАЖУ!*\n\n"
+            f"🔴 *ПРОДАТЬ*\n"
+            f"💰 Цена: ${price:,.0f}\n"
+            f"🎯 Уверенность: {confidence:.1%}\n"
+            f"📊 RSI: {info.get('rsi', 50):.1f}\n\n"
+            f"{strength}"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔴 Продать", callback_data=f"sell_{symbol}_{price}")]])
+    else:
+        text = (
+            f"⏸️ *{symbol} — НЕТ СИГНАЛА*\n\n"
+            f"💰 Цена: ${price:,.0f}\n"
+            f"📊 RSI: {info.get('rsi', 50):.1f}\n\n"
+            f"{strength}\n\n"
+            f"💡 Продолжайте наблюдать"
+        )
+        kb = None
+    
+    await context.bot.send_message(chat_id=user_id, text=text, reply_markup=kb, parse_mode='Markdown')
+
+async def execute_buy(context, user_id, symbol, price):
+    balance = get_balance(user_id)
+    rec = get_budget_recommendations(balance)
+    amount = rec['max_position_usdt']
+    
+    if subtract_balance(user_id, amount):
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ *ПОКУПКА ВЫПОЛНЕНА!*\n\n"
+                 f"📊 {symbol}\n"
+                 f"💰 Сумма: ${amount:.2f}\n"
+                 f"📈 Цена: ${price:,.0f}\n"
+                 f"🛑 Стоп-лосс: -{rec['stop_loss_percent']}%\n"
+                 f"🎯 Тейк-профит: +{rec['take_profit_percent']}%\n\n"
+                 f"💡 Новый баланс: ${get_balance(user_id):.2f}",
+            parse_mode='Markdown'
+        )
+    else:
+        await context.bot.send_message(chat_id=user_id, text="❌ Недостаточно средств на балансе!")
+
+async def execute_sell(context, user_id, symbol, price):
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"✅ *ПРОДАЖА ВЫПОЛНЕНА!*\n\n"
+             f"📊 {symbol}\n"
+             f"📈 Цена: ${price:,.0f}\n\n"
+             f"💰 Баланс: ${get_balance(user_id):.2f}",
+        parse_mode='Markdown'
+    )
+
+# ========== ФОНОВАЯ ПРОВЕРКА ЧЕРЕЗ ЗАДАЧУ ==========
+async def periodic_check(application):
+    """Фоновая проверка рынка каждую минуту (для работы с вебхуком)"""
+    while True:
+        await asyncio.sleep(60)  # 60 секунд
+        if model.is_trained:
+            for sym in SYMBOLS:
+                try:
                     ticker = exchange.fetch_ticker(sym)
-                    name = sym.replace("/USDT", "")
-                    best_signals.append({
-                        'symbol': name,
-                        'pred': pred,
-                        'conf': conf,
-                        'price': ticker['last']
-                    })
-                    signal_history[name].append({
-                        'timestamp': datetime.now(),
-                        'pred': pred,
-                        'conf': conf,
-                        'price': ticker['last']
-                    })
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                logger.error(f"Ошибка {sym}: {e}")
-        
-        best_signals.sort(key=lambda x: x['conf'], reverse=True)
-        for signal in best_signals[:3]:
-            await send_signal(uid, context, signal['symbol'], signal['pred'], signal['conf'], signal['price'])
-            await asyncio.sleep(1)
+                    pred, conf, info = model.predict(sym)
+                    for uid in ALLOWED_USERS:
+                        await send_signal_to_user(application, uid, sym, pred, conf, info, ticker['last'])
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    logger.error(f"Ошибка {sym}: {e}")
 
-async def send_report(context):
-    if not model.is_trained:
-        return
-    
-    now = datetime.now()
-    ten_min_ago = now - timedelta(minutes=10)
-    
-    pair_stats = []
-    for symbol, history in signal_history.items():
-        recent = [h for h in history if h['timestamp'] > ten_min_ago]
-        if not recent:
-            continue
-        signal_count = len(recent)
-        max_conf = max([h['conf'] for h in recent])
-        avg_conf = sum([h['conf'] for h in recent]) / signal_count
-        buy_count = sum(1 for h in recent if h['pred'] == 1)
-        sell_count = signal_count - buy_count
-        pair_stats.append({
-            'symbol': symbol,
-            'signal_count': signal_count,
-            'max_conf': max_conf,
-            'avg_conf': avg_conf,
-            'buy_count': buy_count,
-            'sell_count': sell_count,
-        })
-    
-    report = f"📊 *ОТЧЁТ ЗА 10 МИНУТ* ({now.strftime('%H:%M')})\n\n"
-    
-    if pair_stats:
-        pair_stats.sort(key=lambda x: x['signal_count'], reverse=True)
-        top_active = pair_stats[:5]
-        report += "🔥 *САМЫЕ АКТИВНЫЕ ПАРЫ:*\n"
-        for i, p in enumerate(top_active):
-            report += f"{i+1}. *{p['symbol']}* — {p['signal_count']} сигн"
-            if p['buy_count'] > p['sell_count']:
-                report += f" (🟢 покупка {p['buy_count']}/{p['signal_count']})\n"
-            else:
-                report += f" (🔴 продажа {p['sell_count']}/{p['signal_count']})\n"
-        
-        pair_stats.sort(key=lambda x: x['max_conf'], reverse=True)
-        top_confident = pair_stats[:5]
-        report += "\n🎯 *САМАЯ ВЫСОКАЯ УВЕРЕННОСТЬ:*\n"
-        for i, p in enumerate(top_confident):
-            emoji = "🟢" if p['buy_count'] > p['sell_count'] else "🔴"
-            report += f"{i+1}. *{p['symbol']}* — {emoji} {p['max_conf']:.0%} (средняя {p['avg_conf']:.0%})\n"
-    else:
-        report += "⚠️ *ЗА 10 МИНУТ НЕТ СИГНАЛОВ*\n"
-    
-    report += "\n💰 *ТЕКУЩИЕ ЦЕНЫ:*\n"
-    try:
-        btc = exchange.fetch_ticker("BTC/USDT")
-        eth = exchange.fetch_ticker("ETH/USDT")
-        report += f"₿ BTC: ${btc['last']:,.0f}\n"
-        report += f"⟠ ETH: ${eth['last']:,.0f}\n"
-    except:
-        pass
-    
-    for uid in ALLOWED_USERS:
-        await context.bot.send_message(chat_id=uid, text=report, parse_mode='Markdown')
-    
-    for symbol in signal_history:
-        signal_history[symbol] = [h for h in signal_history[symbol] if h['timestamp'] > now - timedelta(minutes=30)]
-
-async def all_signals(uid, context):
-    if not model.is_trained:
-        await safe_edit(uid, context, "❌ Сначала обучите модель!", get_panel(uid))
-        return
-    all_sig = model.predict_all()
-    if not all_sig:
-        await safe_edit(uid, context, "📊 *НЕТ СИГНАЛОВ*", get_panel(uid))
-        return
-    text = "📊 *ВСЕ СИГНАЛЫ*\n\n"
-    for sig in all_sig[:15]:
-        text += f"{sig['strength']} {sig['symbol']}: {sig['action']} ({sig['confidence']:.0%})\n"
-    await safe_edit(uid, context, text, get_panel(uid))
-
-async def top_buy_signals(uid, context):
-    if not model.is_trained:
-        await safe_edit(uid, context, "❌ Сначала обучите модель!", get_panel(uid))
-        return
-    all_sig = model.predict_all()
-    buy = [s for s in all_sig if "ПОКУПАТЬ" in s['action']]
-    if not buy:
-        await safe_edit(uid, context, "📊 *НЕТ СИГНАЛОВ*", get_panel(uid))
-        return
-    text = "🏆 *ТОП-5 ПОКУПКА*\n\n"
-    for i, sig in enumerate(buy[:5]):
-        text += f"{i+1}. *{sig['symbol']}*: {sig['confidence']:.0%}\n"
-    await safe_edit(uid, context, text, get_panel(uid))
-
-async def top_sell_signals(uid, context):
-    if not model.is_trained:
-        await safe_edit(uid, context, "❌ Сначала обучите модель!", get_panel(uid))
-        return
-    all_sig = model.predict_all()
-    sell = [s for s in all_sig if "ПРОДАВАТЬ" in s['action']]
-    if not sell:
-        await safe_edit(uid, context, "📊 *НЕТ СИГНАЛОВ*", get_panel(uid))
-        return
-    text = "🏆 *ТОП-5 ПРОДАЖА*\n\n"
-    for i, sig in enumerate(sell[:5]):
-        text += f"{i+1}. *{sig['symbol']}*: {sig['confidence']:.0%}\n"
-    await safe_edit(uid, context, text, get_panel(uid))
-
-# ========== КОМАНДЫ ==========
-async def start(update, context):
+# ========== ОБРАБОТЧИКИ ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ALLOWED_USERS:
         await update.message.reply_text("❌ Доступ запрещён")
         return
-    if get_balance(uid) == 500:
-        set_balance(uid, 500)
-    await safe_edit(uid, context,
-        f"🧠 *УМНЫЙ ТОРГОВЫЙ БОТ*\n\n"
-        f"💰 Баланс: ${get_balance(uid):.0f}\n"
-        f"📊 Моделей: {len(model.models)}/{len(SYMBOLS)}\n"
-        f"⏱️ Сигналы: лучшие 3 каждую минуту\n"
-        f"📈 Отчёт: каждые 10 минут\n\n"
-        f"👇 Выберите действие:",
-        get_panel(uid))
-
-async def handler(update, context):
-    query = update.callback_query
-    try:
-        await query.answer()
-    except:
-        return
     
-    uid = update.effective_chat.id
+    if str(uid) not in user_balances:
+        user_balances[str(uid)] = 1000
+    
+    await update.message.reply_text(
+        "🤖 *ТОРГОВЫЙ БОТ*\n\n"
+        "✅ Автосигналы раз в минуту\n"
+        "✅ 4 монеты: BTC, ETH, SOL, BNB\n"
+        "✅ Рекомендации по вашему бюджету\n"
+        "✅ Стоп-лосс и тейк-профит\n"
+        "✅ Автоторговля с защитой\n\n"
+        "👇 Выберите действие:",
+        reply_markup=get_main_keyboard(uid),
+        parse_mode='Markdown'
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = update.effective_user.id
+    if uid not in ALLOWED_USERS:
+        await query.edit_message_text("❌ Нет доступа")
+        return
     data = query.data
     
-    if data == "main":
-        await safe_edit(uid, context, f"🧠 *МЕНЮ*\n💰 Баланс: ${get_balance(uid):.0f}", get_panel(uid))
-    elif data == "all_signals":
-        await all_signals(uid, context)
-    elif data == "top_buy":
-        await top_buy_signals(uid, context)
-    elif data == "top_sell":
-        await top_sell_signals(uid, context)
-    elif data == "toggle":
-        auto = get_auto(uid)
-        auto['enabled'] = not auto['enabled']
-        save_data()
-        await safe_edit(uid, context, f"✅ Автоторговля {'ВКЛ' if auto['enabled'] else 'ВЫКЛ'}", get_panel(uid))
+    if data.startswith("buy_"):
+        parts = data.split("_")
+        symbol = parts[1] + "/" + parts[2]
+        price = float(parts[3])
+        await query.edit_message_text("🟢 Исполняю покупку...")
+        await execute_buy(context, uid, symbol, price)
+        await start(update, context)
+    
+    elif data.startswith("sell_"):
+        parts = data.split("_")
+        symbol = parts[1] + "/" + parts[2]
+        price = float(parts[3])
+        await query.edit_message_text("🔴 Исполняю продажу...")
+        await execute_sell(context, uid, symbol, price)
+        await start(update, context)
+    
+    elif data.startswith("signal_"):
+        sym = data.split("_")[1].replace("-", "/")
+        if not model.is_trained:
+            await query.edit_message_text("❌ Сначала обучите модель (кнопка «Обучить»)")
+            return
+        ticker = exchange.fetch_ticker(sym)
+        pred, conf, info = model.predict(sym)
+        await send_signal_to_user(context, uid, sym, pred, conf, info, ticker['last'])
+        await start(update, context)
+    
+    elif data == "budget":
+        balance = get_balance(uid)
+        rec = get_budget_recommendations(balance)
+        text = (
+            f"📊 *РЕКОМЕНДАЦИИ ПО БЮДЖЕТУ*\n\n"
+            f"💰 Ваш баланс: **${balance:.2f}**\n"
+            f"📈 Уровень: {rec['level']}\n\n"
+            f"*Стратегия:* {rec['advice']}\n\n"
+            f"*Размер позиции:* {rec['position_percent']}% = **${rec['max_position_usdt']:.2f}**\n"
+            f"*Стоп-лосс:* -{rec['stop_loss_percent']}%\n"
+            f"*Тейк-профит:* +{rec['take_profit_percent']}%\n"
+            f"*Рекомендуемые монеты:* {', '.join(rec['recommended_symbols'])}\n\n"
+            f"{rec['warning']}"
+        )
+        await query.edit_message_text(text, parse_mode='Markdown')
+        await start(update, context)
+    
     elif data == "train":
-        await safe_edit(uid, context, "🧠 ОБУЧЕНИЕ... 3-5 минут", get_panel(uid))
-        res = model.train(SYMBOLS)
-        trained = len([r for r in res.values() if "accuracy" in r])
-        await safe_edit(uid, context, f"✅ ОБУЧЕНО {trained}/{len(SYMBOLS)} ПАР!", get_panel(uid))
-    elif data == "settings":
-        await safe_edit(uid, context, "⚙️ *НАСТРОЙКИ*", get_settings_panel(uid))
-    elif data == "set_budget":
-        await safe_edit(uid, context, "💰 Введите бюджет (50-10000):", get_settings_panel(uid))
-        context.user_data['set_budget'] = uid
-    elif data == "set_pos":
-        await safe_edit(uid, context, "📊 Размер позиции (10-500):", get_settings_panel(uid))
-        context.user_data['set_pos'] = uid
-    elif data == "set_sl":
-        await safe_edit(uid, context, "🛡️ Стоп-лосс % (2-10):", get_settings_panel(uid))
-        context.user_data['set_sl'] = uid
-    elif data == "set_tp":
-        await safe_edit(uid, context, "🎯 Тейк-профит % (4-20):", get_settings_panel(uid))
-        context.user_data['set_tp'] = uid
+        await query.edit_message_text("🧠 Обучение моделей... 2-3 минуты")
+        res = model.train()
+        text = "✅ *Модели обучены!*\n\n"
+        for sym, r in res.items():
+            if "error" in r:
+                text += f"❌ {sym}: {r['error']}\n"
+            else:
+                text += f"✅ {sym}: точность {r['accuracy']:.2%}\n"
+        await query.edit_message_text(text, parse_mode='Markdown')
+        await start(update, context)
+    
+    elif data == "autotrade":
+        await query.edit_message_text("⚙️ *АВТОТОРГОВЛЯ*", reply_markup=get_autotrade_keyboard(uid), parse_mode='Markdown')
+    
+    elif data == "at_toggle":
+        at = get_autotrade(uid)
+        at['enabled'] = not at['enabled']
+        await query.edit_message_text(f"✅ Автоторговля {'включена' if at['enabled'] else 'выключена'}")
+        await button_handler(update, context)
+    
+    elif data == "at_mode":
+        at = get_autotrade(uid)
+        modes = ['signal_only', 'dca', 'grid']
+        idx = (modes.index(at['mode']) + 1) % len(modes)
+        at['mode'] = modes[idx]
+        await query.edit_message_text(f"✅ Режим: {at['mode']}")
+        await button_handler(update, context)
+    
+    elif data == "at_limit_trades":
+        await query.edit_message_text("💰 Введите лимит сделок в день (1-20):")
+        context.user_data['waiting_trades_limit'] = uid
+    
+    elif data == "at_limit_loss":
+        await query.edit_message_text("📉 Введите лимит убытка в день % (1-50):")
+        context.user_data['waiting_loss_limit'] = uid
+    
+    elif data == "at_cooldown":
+        await query.edit_message_text("⏱️ Введите кулдаун (5-120 минут):")
+        context.user_data['waiting_cooldown'] = uid
+    
+    elif data == "balance":
+        await query.edit_message_text(f"💰 *БАЛАНС*\n💵 USDT: ${get_balance(uid):.2f}", parse_mode='Markdown')
+        await start(update, context)
+    
     elif data == "stats":
-        bal = get_balance(uid)
-        auto = get_auto(uid)
-        await safe_edit(uid, context,
-            f"📊 *СТАТИСТИКА*\n💰 Баланс: ${bal:.0f}\n📈 Сделок сегодня: {auto['trades_today']}\n🛡️ Стоп: {auto['stop_loss']}%\n🎯 Профит: {auto['take_profit']}%",
-            get_panel(uid))
-    elif data == "show_balance":
-        try:
-            await query.answer(f"Баланс: ${get_balance(uid):.0f}")
-        except:
-            pass
-    elif data == "help":
-        await safe_edit(uid, context, "📖 *ИНСТРУКЦИЯ*\n\n1️⃣ ОБУЧИТЬ (1 раз)\n2️⃣ СИГНАЛ ПО ВСЕМ\n3️⃣ ТОП 5\n\n📡 Сигналы каждую минуту!", get_panel(uid))
+        at = get_autotrade(uid)
+        text = (
+            f"📊 *СТАТИСТИКА*\n\n"
+            f"🎯 Модель: {'✅ Обучена' if model.is_trained else '❌ Нет'}\n"
+            f"💰 Баланс: ${get_balance(uid):.2f}\n"
+            f"🤖 Автоторговля: {'✅ Вкл' if at['enabled'] else '❌ Выкл'}\n"
+            f"📈 Режим: {at['mode']}\n"
+            f"📊 Сделок сегодня: {at['trades_today']}/{at['max_trades_per_day']}\n"
+            f"📉 Убыток сегодня: {at['daily_loss']:.1f}%"
+        )
+        await query.edit_message_text(text, parse_mode='Markdown')
+        await start(update, context)
+    
+    elif data == "tips":
+        tips = (
+            "📖 *СОВЕТЫ ПО ТОРГОВЛЕ*\n\n"
+            "1️⃣ *Управление рисками*\n"
+            "• Входите 2-5% от депозита\n"
+            "• Всегда ставьте стоп-лосс\n\n"
+            "2️⃣ *Сигналы*\n"
+            "• 🟢 ПОКУПАТЬ → входите\n"
+            "• 🔴 ПРОДАВАТЬ → фиксируйте\n"
+            "• ⏸️ ЖДАТЬ → ничего не делайте\n\n"
+            "3️⃣ *Ошибки новичков*\n"
+            "• Не усредняйте убытки\n"
+            "• Не торгуйте на эмоциях\n"
+            "• Переобучайте модель раз в сутки\n\n"
+            "⚠️ Торговля криптовалютами — высокий риск!"
+        )
+        await query.edit_message_text(tips, parse_mode='Markdown')
+        await start(update, context)
+    
+    elif data == "back":
+        await start(update, context)
 
-async def text_input(update, context):
+async def handle_message(update, context):
     uid = update.effective_user.id
-    text = update.message.text.strip()
-    
-    if context.user_data.get('set_budget') == uid:
+    if context.user_data.get('waiting_trades_limit') == uid:
         try:
-            v = float(text)
-            if 50 <= v <= 10000:
-                set_balance(uid, v)
-                await update.message.reply_text(f"✅ Бюджет: ${v:.0f}")
+            val = int(update.message.text)
+            if 1 <= val <= 20:
+                get_autotrade(uid)['max_trades_per_day'] = val
+                await update.message.reply_text(f"✅ Лимит сделок: {val} в день")
             else:
-                await update.message.reply_text("❌ От 50 до 10000")
+                await update.message.reply_text("❌ Введите число от 1 до 20")
         except:
             await update.message.reply_text("❌ Введите число")
-        context.user_data.pop('set_budget', None)
-        await safe_edit(uid, context, f"🧠 *МЕНЮ*\n💰 Баланс: ${get_balance(uid):.0f}", get_panel(uid))
+        del context.user_data['waiting_trades_limit']
     
-    elif context.user_data.get('set_pos') == uid:
+    elif context.user_data.get('waiting_loss_limit') == uid:
         try:
-            v = float(text)
-            if 10 <= v <= 500:
-                get_auto(uid)['pos_size'] = v
-                save_data()
-                await update.message.reply_text(f"✅ Позиция: ${v:.0f}")
+            val = float(update.message.text)
+            if 1 <= val <= 50:
+                get_autotrade(uid)['max_daily_loss'] = val
+                await update.message.reply_text(f"✅ Лимит убытка: {val}% в день")
             else:
-                await update.message.reply_text("❌ От 10 до 500")
+                await update.message.reply_text("❌ Введите число от 1 до 50")
         except:
             await update.message.reply_text("❌ Введите число")
-        context.user_data.pop('set_pos', None)
-        await safe_edit(uid, context, f"🧠 *МЕНЮ*\n💰 Баланс: ${get_balance(uid):.0f}", get_panel(uid))
+        del context.user_data['waiting_loss_limit']
     
-    elif context.user_data.get('set_sl') == uid:
+    elif context.user_data.get('waiting_cooldown') == uid:
         try:
-            v = float(text)
-            if 2 <= v <= 10:
-                get_auto(uid)['stop_loss'] = v
-                save_data()
-                await update.message.reply_text(f"✅ Стоп-лосс: {v}%")
+            val = int(update.message.text)
+            if 5 <= val <= 120:
+                get_autotrade(uid)['cooldown_minutes'] = val
+                await update.message.reply_text(f"✅ Кулдаун: {val} минут")
             else:
-                await update.message.reply_text("❌ От 2 до 10")
+                await update.message.reply_text("❌ Введите число от 5 до 120")
         except:
             await update.message.reply_text("❌ Введите число")
-        context.user_data.pop('set_sl', None)
-        await safe_edit(uid, context, f"🧠 *МЕНЮ*\n💰 Баланс: ${get_balance(uid):.0f}", get_panel(uid))
-    
-    elif context.user_data.get('set_tp') == uid:
-        try:
-            v = float(text)
-            if 4 <= v <= 20:
-                get_auto(uid)['take_profit'] = v
-                save_data()
-                await update.message.reply_text(f"✅ Тейк-профит: {v}%")
-            else:
-                await update.message.reply_text("❌ От 4 до 20")
-        except:
-            await update.message.reply_text("❌ Введите число")
-        context.user_data.pop('set_tp', None)
-        await safe_edit(uid, context, f"🧠 *МЕНЮ*\n💰 Баланс: ${get_balance(uid):.0f}", get_panel(uid))
+        del context.user_data['waiting_cooldown']
 
+# ========== FLASK ДЛЯ WEBHOOK И HEALTH CHECK ==========
+flask_app = Flask(__name__)
+telegram_app = None
+
+@flask_app.route('/')
+def health():
+    return jsonify({"status": "alive", "message": "Bot is running"}), 200
+
+@flask_app.route(f'/{TOKEN}', methods=['POST'])
+def webhook():
+    try:
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        asyncio.run_coroutine_threadsafe(update_queue.put(update), loop)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return jsonify({"status": "error"}), 500
+
+from asyncio import Queue
+update_queue = Queue()
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+async def process_updates():
+    while True:
+        update = await update_queue.get()
+        await telegram_app.process_update(update)
+
+# ========== ЗАПУСК ==========
 def main():
-    load_data()
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
+    global telegram_app, loop
     
-    if app.job_queue:
-        app.job_queue.run_repeating(check_markets, interval=CHECK_INTERVAL, first=10)
-        app.job_queue.run_repeating(send_report, interval=REPORT_INTERVAL, first=15)
+    # Создаём приложение Telegram
+    telegram_app = Application.builder().token(TOKEN).build()
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CallbackQueryHandler(button_handler))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("="*70)
-    print(f"🧠 БОТ ЗАПУЩЕН | {len(SYMBOLS)} пар")
-    print("="*70)
-    app.run_polling()
+    # Запускаем обработку апдейтов в фоне
+    asyncio.run_coroutine_threadsafe(process_updates(), loop)
+    
+    # Запускаем фоновую проверку рынка
+    asyncio.run_coroutine_threadsafe(periodic_check(telegram_app), loop)
+    
+    # Запускаем Flask для вебхука и health check
+    port = int(os.environ.get('PORT', 8080))
+    print("="*50)
+    print("🤖 ТОРГОВЫЙ БОТ ЗАПУЩЕН НА RENDER")
+    print(f"🌐 Webhook URL: https://your-app.onrender.com/{TOKEN}")
+    print("✅ Health check доступен по /")
+    print("="*50)
+    
+    flask_app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
     main()
