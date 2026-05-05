@@ -238,7 +238,6 @@ async def send_signal_to_user(context, user_id, symbol, prediction, confidence, 
         kb = None
     await context.bot.send_message(chat_id=user_id, text=text, reply_markup=kb, parse_mode='Markdown')
 
-# ========== ИСПОЛНЕНИЕ ==========
 async def execute_buy(context, user_id, symbol, price):
     rec = get_budget_recommendations(get_balance(user_id))
     if subtract_balance(user_id, rec['max_position_usdt']):
@@ -249,19 +248,21 @@ async def execute_buy(context, user_id, symbol, price):
 async def execute_sell(context, user_id, symbol, price):
     await context.bot.send_message(chat_id=user_id, text=f"✅ ПРОДАНО!\n💰 Баланс: ${get_balance(user_id):.2f}", parse_mode='Markdown')
 
-# ========== ФОНОВАЯ ПРОВЕРКА ==========
-async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
-    if not model.is_trained:
-        return
-    for sym in SYMBOLS:
-        try:
-            ticker = exchange.fetch_ticker(sym)
-            pred, conf, info = model.predict(sym)
-            for uid in ALLOWED_USERS:
-                await send_signal_to_user(context, uid, sym, pred, conf, info, ticker['last'])
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.error(f"Ошибка {sym}: {e}")
+# ========== background_task ==========
+async def background_task(app):
+    """Фоновый цикл без JobQueue"""
+    while True:
+        await asyncio.sleep(CHECK_INTERVAL)
+        if model.is_trained:
+            for sym in SYMBOLS:
+                try:
+                    ticker = exchange.fetch_ticker(sym)
+                    pred, conf, info = model.predict(sym)
+                    for uid in ALLOWED_USERS:
+                        await send_signal_to_user(app, uid, sym, pred, conf, info, ticker['last'])
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    logger.error(f"Ошибка {sym}: {e}")
 
 # ========== ОБРАБОТЧИКИ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -382,7 +383,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.job_queue.run_repeating(periodic_check, interval=CHECK_INTERVAL, first=10)
+    
+    # Запускаем фоновую задачу в отдельном цикле
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(background_task(app))
+    
     print("🤖 БОТ ЗАПУЩЕН")
     app.run_polling()
 
