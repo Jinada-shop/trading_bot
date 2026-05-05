@@ -3,7 +3,6 @@ import logging
 import json
 import numpy as np
 import pandas as pd
-import asyncio
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -12,7 +11,6 @@ import ccxt
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 import joblib
-from threading import Thread
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -38,11 +36,6 @@ def get_balance(user_id):
 
 def set_balance(user_id, amount):
     user_balances[str(user_id)] = amount
-
-def add_balance(user_id, amount):
-    new = get_balance(user_id) + amount
-    set_balance(user_id, new)
-    return new
 
 def subtract_balance(user_id, amount):
     current = get_balance(user_id)
@@ -265,19 +258,6 @@ def get_main_keyboard(user_id):
          InlineKeyboardButton("💬 Советы", callback_data="tips")],
     ])
 
-def get_autotrade_keyboard(user_id):
-    at = get_autotrade(user_id)
-    status = "✅ Вкл" if at['enabled'] else "❌ Выкл"
-    mode = at['mode'].replace('_', ' ').title()
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🔘 Вкл/Выкл: {status}", callback_data="at_toggle")],
-        [InlineKeyboardButton(f"📊 Режим: {mode}", callback_data="at_mode")],
-        [InlineKeyboardButton(f"💰 Лимит сделок: {at['max_trades_per_day']}/день", callback_data="at_limit_trades")],
-        [InlineKeyboardButton(f"📉 Лимит убытка: {at['max_daily_loss']}%", callback_data="at_limit_loss")],
-        [InlineKeyboardButton(f"⏱️ Кулдаун: {at['cooldown_minutes']} мин", callback_data="at_cooldown")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")],
-    ])
-
 # ========== ОТПРАВКА СИГНАЛОВ ==========
 async def send_signal_to_user(context, user_id, symbol, prediction, confidence, info, price):
     balance = get_balance(user_id)
@@ -353,11 +333,10 @@ async def execute_sell(context, user_id, symbol, price):
         parse_mode='Markdown'
     )
 
-# ========== ФОНОВАЯ ПРОВЕРКА ЧЕРЕЗ ЗАДАЧУ ==========
+# ========== ФОНОВАЯ ПРОВЕРКА ==========
 async def periodic_check(application):
-    """Фоновая проверка рынка каждую минуту (для работы с вебхуком)"""
     while True:
-        await asyncio.sleep(60)  # 60 секунд
+        await asyncio.sleep(60)
         if model.is_trained:
             for sym in SYMBOLS:
                 try:
@@ -369,7 +348,7 @@ async def periodic_check(application):
                 except Exception as e:
                     logger.error(f"Ошибка {sym}: {e}")
 
-# ========== ОБРАБОТЧИКИ ==========
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ALLOWED_USERS:
@@ -456,33 +435,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
     
     elif data == "autotrade":
-        await query.edit_message_text("⚙️ *АВТОТОРГОВЛЯ*", reply_markup=get_autotrade_keyboard(uid), parse_mode='Markdown')
-    
-    elif data == "at_toggle":
-        at = get_autotrade(uid)
-        at['enabled'] = not at['enabled']
-        await query.edit_message_text(f"✅ Автоторговля {'включена' if at['enabled'] else 'выключена'}")
-        await button_handler(update, context)
-    
-    elif data == "at_mode":
-        at = get_autotrade(uid)
-        modes = ['signal_only', 'dca', 'grid']
-        idx = (modes.index(at['mode']) + 1) % len(modes)
-        at['mode'] = modes[idx]
-        await query.edit_message_text(f"✅ Режим: {at['mode']}")
-        await button_handler(update, context)
-    
-    elif data == "at_limit_trades":
-        await query.edit_message_text("💰 Введите лимит сделок в день (1-20):")
-        context.user_data['waiting_trades_limit'] = uid
-    
-    elif data == "at_limit_loss":
-        await query.edit_message_text("📉 Введите лимит убытка в день % (1-50):")
-        context.user_data['waiting_loss_limit'] = uid
-    
-    elif data == "at_cooldown":
-        await query.edit_message_text("⏱️ Введите кулдаун (5-120 минут):")
-        context.user_data['waiting_cooldown'] = uid
+        await query.edit_message_text("⚙️ *АВТОТОРГОВЛЯ*\nНастройки будут добавлены позже", parse_mode='Markdown')
+        await start(update, context)
     
     elif data == "balance":
         await query.edit_message_text(f"💰 *БАЛАНС*\n💵 USDT: ${get_balance(uid):.2f}", parse_mode='Markdown')
@@ -495,7 +449,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎯 Модель: {'✅ Обучена' if model.is_trained else '❌ Нет'}\n"
             f"💰 Баланс: ${get_balance(uid):.2f}\n"
             f"🤖 Автоторговля: {'✅ Вкл' if at['enabled'] else '❌ Выкл'}\n"
-            f"📈 Режим: {at['mode']}\n"
             f"📊 Сделок сегодня: {at['trades_today']}/{at['max_trades_per_day']}\n"
             f"📉 Убыток сегодня: {at['daily_loss']:.1f}%"
         )
@@ -520,79 +473,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.edit_message_text(tips, parse_mode='Markdown')
         await start(update, context)
-    
-    elif data == "back":
-        await start(update, context)
 
-async def handle_message(update, context):
-    uid = update.effective_user.id
-    if context.user_data.get('waiting_trades_limit') == uid:
-        try:
-            val = int(update.message.text)
-            if 1 <= val <= 20:
-                get_autotrade(uid)['max_trades_per_day'] = val
-                await update.message.reply_text(f"✅ Лимит сделок: {val} в день")
-            else:
-                await update.message.reply_text("❌ Введите число от 1 до 20")
-        except:
-            await update.message.reply_text("❌ Введите число")
-        del context.user_data['waiting_trades_limit']
-    
-    elif context.user_data.get('waiting_loss_limit') == uid:
-        try:
-            val = float(update.message.text)
-            if 1 <= val <= 50:
-                get_autotrade(uid)['max_daily_loss'] = val
-                await update.message.reply_text(f"✅ Лимит убытка: {val}% в день")
-            else:
-                await update.message.reply_text("❌ Введите число от 1 до 50")
-        except:
-            await update.message.reply_text("❌ Введите число")
-        del context.user_data['waiting_loss_limit']
-    
-    elif context.user_data.get('waiting_cooldown') == uid:
-        try:
-            val = int(update.message.text)
-            if 5 <= val <= 120:
-                get_autotrade(uid)['cooldown_minutes'] = val
-                await update.message.reply_text(f"✅ Кулдаун: {val} минут")
-            else:
-                await update.message.reply_text("❌ Введите число от 5 до 120")
-        except:
-            await update.message.reply_text("❌ Введите число")
-        del context.user_data['waiting_cooldown']
+async def handle_message(update, Update, context):
+    # Простой обработчик текстовых сообщений
+    pass
 
-# ========== FLASK ДЛЯ WEBHOOK И HEALTH CHECK ==========
-flask_app = Flask(__name__)
+# ========== FLASK ДЛЯ WEBHOOK ==========
+webhook_app = Flask(__name__)
 telegram_app = None
 
-@flask_app.route('/')
-def health():
-    return jsonify({"status": "alive", "message": "Bot is running"}), 200
-
-@flask_app.route(f'/{TOKEN}', methods=['POST'])
+@webhook_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
     try:
         update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        asyncio.run_coroutine_threadsafe(update_queue.put(update), loop)
+        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return jsonify({"status": "error"}), 500
 
-from asyncio import Queue
-update_queue = Queue()
+@webhook_app.route('/')
+def health():
+    return jsonify({"status": "alive", "message": "Bot is running"}), 200
+
+# ========== ЗАПУСК ==========
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
-async def process_updates():
-    while True:
-        update = await update_queue.get()
-        await telegram_app.process_update(update)
-
-# ========== ЗАПУСК ==========
 def main():
-    global telegram_app, loop
+    global telegram_app
     
     # Создаём приложение Telegram
     telegram_app = Application.builder().token(TOKEN).build()
@@ -600,21 +509,18 @@ def main():
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Запускаем обработку апдейтов в фоне
-    asyncio.run_coroutine_threadsafe(process_updates(), loop)
-    
-    # Запускаем фоновую проверку рынка
+    # Запускаем фоновую проверку
     asyncio.run_coroutine_threadsafe(periodic_check(telegram_app), loop)
     
-    # Запускаем Flask для вебхука и health check
-    port = int(os.environ.get('PORT', 8080))
+    # Запускаем Flask
+    port = int(os.environ.get('PORT', 10000))
     print("="*50)
     print("🤖 ТОРГОВЫЙ БОТ ЗАПУЩЕН НА RENDER")
     print(f"🌐 Webhook URL: https://your-app.onrender.com/{TOKEN}")
     print("✅ Health check доступен по /")
     print("="*50)
     
-    flask_app.run(host='0.0.0.0', port=port)
+    webhook_app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
     main()
