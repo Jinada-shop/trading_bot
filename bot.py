@@ -5,7 +5,6 @@ import asyncio
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import ccxt
@@ -23,13 +22,14 @@ ALLOWED_USERS = [int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 TIMEFRAME = "1h"
 MIN_CONFIDENCE = 0.6
+CHECK_INTERVAL = 60
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 exchange = ccxt.binance({"enableRateLimit": True})
 
-# ========== БАЛАНС ПОЛЬЗОВАТЕЛЯ ==========
+# ========== БАЛАНС ==========
 user_balances = {}
 
 def get_balance(user_id):
@@ -45,87 +45,48 @@ def subtract_balance(user_id, amount):
         return True
     return False
 
-# ========== АВТОТОРГОВЛЯ ==========
-def get_default_autotrade():
-    return {
-        'enabled': False,
-        'mode': 'signal_only',
-        'max_trades_per_day': 5,
-        'max_daily_loss': 10,
-        'cooldown_minutes': 30,
-        'position': None,
-        'entry_price': 0,
-        'trades_today': 0,
-        'daily_loss': 0,
-        'last_trade_time': None
-    }
+def add_balance(user_id, amount):
+    set_balance(user_id, get_balance(user_id) + amount)
+    return get_balance(user_id)
 
+# ========== АВТОТОРГОВЛЯ ==========
 autotrade_settings = {}
 
 def get_autotrade(user_id):
     uid = str(user_id)
     if uid not in autotrade_settings:
-        autotrade_settings[uid] = get_default_autotrade()
+        autotrade_settings[uid] = {
+            'enabled': False, 'mode': 'signal_only', 'max_trades_per_day': 5,
+            'max_daily_loss': 10, 'cooldown_minutes': 30, 'trades_today': 0, 'daily_loss': 0
+        }
     return autotrade_settings[uid]
 
-# ========== РЕКОМЕНДАЦИИ ПО БЮДЖЕТУ ==========
+# ========== РЕКОМЕНДАЦИИ ==========
 def get_budget_recommendations(balance_usdt):
     if balance_usdt < 100:
         return {
-            'level': '🟢 Начинающий',
-            'advice': 'Торгуйте аккуратно',
-            'position_percent': 15,
-            'max_position_usdt': balance_usdt * 0.15,
-            'stop_loss_percent': 7,
-            'take_profit_percent': 12,
-            'recommended_symbols': ['BTC/USDT'],
+            'level': '🟢 Начинающий', 'position_percent': 15, 'max_position_usdt': balance_usdt * 0.15,
+            'stop_loss_percent': 7, 'take_profit_percent': 12, 'recommended_symbols': ['BTC/USDT'],
             'warning': '⚠️ Не рискуйте больше чем готовы потерять!'
         }
     elif balance_usdt < 500:
         return {
-            'level': '🟡 Средний',
-            'advice': 'Можно торговать активнее',
-            'position_percent': 8,
-            'max_position_usdt': balance_usdt * 0.08,
-            'stop_loss_percent': 6,
-            'take_profit_percent': 12,
-            'recommended_symbols': ['BTC/USDT', 'ETH/USDT'],
+            'level': '🟡 Средний', 'position_percent': 8, 'max_position_usdt': balance_usdt * 0.08,
+            'stop_loss_percent': 6, 'take_profit_percent': 12, 'recommended_symbols': ['BTC/USDT', 'ETH/USDT'],
             'warning': '✅ Не забывайте про стоп-лоссы'
         }
     elif balance_usdt < 2000:
         return {
-            'level': '🟠 Продвинутый',
-            'advice': 'Диверсифицируйте портфель',
-            'position_percent': 5,
-            'max_position_usdt': balance_usdt * 0.05,
-            'stop_loss_percent': 5,
-            'take_profit_percent': 10,
-            'recommended_symbols': ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'],
+            'level': '🟠 Продвинутый', 'position_percent': 5, 'max_position_usdt': balance_usdt * 0.05,
+            'stop_loss_percent': 5, 'take_profit_percent': 10, 'recommended_symbols': ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'],
             'warning': '📊 Используйте автоторговлю с осторожностью'
         }
     else:
         return {
-            'level': '🔴 Профессиональный',
-            'advice': 'Можете использовать сложные стратегии',
-            'position_percent': 3,
-            'max_position_usdt': balance_usdt * 0.03,
-            'stop_loss_percent': 4,
-            'take_profit_percent': 8,
-            'recommended_symbols': ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT'],
+            'level': '🔴 Профессиональный', 'position_percent': 3, 'max_position_usdt': balance_usdt * 0.03,
+            'stop_loss_percent': 4, 'take_profit_percent': 8, 'recommended_symbols': ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT'],
             'warning': '🎯 Используйте трейлинг стоп'
         }
-
-def get_signal_strength(prediction, confidence):
-    if prediction is None:
-        return "Недостаточно данных"
-    if prediction == 1 and confidence > 0.7:
-        return "🟢 СИЛЬНЫЙ СИГНАЛ"
-    elif prediction == 1 and confidence > 0.6:
-        return "🟡 СРЕДНИЙ СИГНАЛ"
-    elif prediction == 0 and confidence > 0.6:
-        return "🔴 СИГНАЛ НА ЗАКРЫТИЕ"
-    else:
-        return "⚪ НЕТ СИГНАЛА"
 
 # ========== КЛАСС МОДЕЛИ ==========
 class TradingModel:
@@ -212,12 +173,7 @@ class TradingModel:
             Xs = self.scalers[symbol].transform(features)
             proba = self.models[symbol].predict_proba(Xs)[0]
             pred = self.models[symbol].predict(Xs)[0]
-            levels = {
-                'stop_loss': closes[-1] * 0.95,
-                'take_profit': closes[-1] * 1.10,
-                'support': np.min(closes[-20:]),
-                'resistance': np.max(closes[-20:])
-            }
+            levels = {'stop_loss': closes[-1] * 0.95, 'take_profit': closes[-1] * 1.10}
             risk = "🟢 Низкий" if rsi < 70 and rsi > 30 else "🟡 Средний" if rsi < 80 and rsi > 20 else "🔴 Высокий"
             return pred, max(proba), {'rsi': rsi, 'levels': levels, 'risk': risk}
         except Exception as e:
@@ -248,128 +204,74 @@ def get_main_keyboard(user_id):
     auto_status = "✅ Вкл" if auto['enabled'] else "❌ Выкл"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"💰 Баланс: ${balance:.2f}", callback_data="balance")],
-        [InlineKeyboardButton("📊 Рекомендации по бюджету", callback_data="budget")],
-        [InlineKeyboardButton("📈 Сигнал (BTC)", callback_data="signal_BTC/USDT"),
-         InlineKeyboardButton("📈 Сигнал (ETH)", callback_data="signal_ETH/USDT")],
-        [InlineKeyboardButton("📈 Сигнал (SOL)", callback_data="signal_SOL/USDT"),
-         InlineKeyboardButton("📈 Сигнал (BNB)", callback_data="signal_BNB/USDT")],
-        [InlineKeyboardButton("🧠 Обучить модель", callback_data="train")],
+        [InlineKeyboardButton("📊 Рекомендации", callback_data="budget")],
+        [InlineKeyboardButton("📈 BTC", callback_data="signal_BTC/USDT"), InlineKeyboardButton("📈 ETH", callback_data="signal_ETH/USDT")],
+        [InlineKeyboardButton("📈 SOL", callback_data="signal_SOL/USDT"), InlineKeyboardButton("📈 BNB", callback_data="signal_BNB/USDT")],
+        [InlineKeyboardButton("🧠 Обучить", callback_data="train")],
         [InlineKeyboardButton(f"🤖 Автоторговля: {auto_status}", callback_data="autotrade")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="stats"),
-         InlineKeyboardButton("💬 Советы", callback_data="tips")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats"), InlineKeyboardButton("💬 Советы", callback_data="tips")],
+        [InlineKeyboardButton("➕ +100", callback_data="deposit_100"), InlineKeyboardButton("➖ -100", callback_data="withdraw_100")],
+    ])
+
+def get_autotrade_keyboard(user_id):
+    at = get_autotrade(user_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{'✅' if at['enabled'] else '❌'} Вкл/Выкл", callback_data="at_toggle")],
+        [InlineKeyboardButton(f"📊 Лимит сделок: {at['max_trades_per_day']}", callback_data="at_limit_trades")],
+        [InlineKeyboardButton(f"📉 Лимит убытка: {at['max_daily_loss']}%", callback_data="at_limit_loss")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back")],
     ])
 
 # ========== ОТПРАВКА СИГНАЛОВ ==========
 async def send_signal_to_user(context, user_id, symbol, prediction, confidence, info, price):
     balance = get_balance(user_id)
-    budget_rec = get_budget_recommendations(balance)
-    strength = get_signal_strength(prediction, confidence)
+    rec = get_budget_recommendations(balance)
     
     if prediction == 1 and confidence > MIN_CONFIDENCE:
-        text = (
-            f"🚨 *{symbol} — СИГНАЛ НА ПОКУПКУ!*\n\n"
-            f"🟢 *КУПИТЬ*\n"
-            f"💰 Цена: ${price:,.0f}\n"
-            f"🎯 Уверенность: {confidence:.1%}\n"
-            f"📊 RSI: {info.get('rsi', 50):.1f}\n"
-            f"⚠️ Риск: {info.get('risk', 'Н/Д')}\n\n"
-            f"*Уровни:*\n"
-            f"🛑 Стоп-лосс: ${info.get('levels', {}).get('stop_loss', 0):,.0f} (-{budget_rec['stop_loss_percent']}%)\n"
-            f"🎯 Тейк-профит: ${info.get('levels', {}).get('take_profit', 0):,.0f} (+{budget_rec['take_profit_percent']}%)\n\n"
-            f"*💰 По вашему бюджету (${balance:.2f}):*\n"
-            f"• Рекомендованная позиция: **${budget_rec['max_position_usdt']:.2f}**\n"
-            f"• {strength}\n\n"
-            f"💡 {budget_rec['advice']}"
-        )
+        text = f"🚨 *{symbol} — ПОКУПКА!*\n💰 ${price:,.0f}\n🎯 Уверенность: {confidence:.1%}\n🛑 Стоп: ${info.get('levels', {}).get('stop_loss', 0):,.0f}\n🎯 Профит: ${info.get('levels', {}).get('take_profit', 0):,.0f}\n💡 Входите ${rec['max_position_usdt']:.2f}"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🟢 Купить", callback_data=f"buy_{symbol}_{price}")]])
     elif prediction == 0 and confidence > MIN_CONFIDENCE:
-        text = (
-            f"🚨 *{symbol} — СИГНАЛ НА ПРОДАЖУ!*\n\n"
-            f"🔴 *ПРОДАТЬ*\n"
-            f"💰 Цена: ${price:,.0f}\n"
-            f"🎯 Уверенность: {confidence:.1%}\n"
-            f"📊 RSI: {info.get('rsi', 50):.1f}\n\n"
-            f"{strength}"
-        )
+        text = f"🚨 *{symbol} — ПРОДАЖА!*\n💰 ${price:,.0f}\n🎯 Уверенность: {confidence:.1%}"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔴 Продать", callback_data=f"sell_{symbol}_{price}")]])
     else:
-        text = (
-            f"⏸️ *{symbol} — НЕТ СИГНАЛА*\n\n"
-            f"💰 Цена: ${price:,.0f}\n"
-            f"📊 RSI: {info.get('rsi', 50):.1f}\n\n"
-            f"{strength}\n\n"
-            f"💡 Продолжайте наблюдать"
-        )
+        text = f"⏸️ *{symbol} — НЕТ СИГНАЛА*\n💰 ${price:,.0f}"
         kb = None
-    
     await context.bot.send_message(chat_id=user_id, text=text, reply_markup=kb, parse_mode='Markdown')
 
+# ========== ИСПОЛНЕНИЕ ==========
 async def execute_buy(context, user_id, symbol, price):
-    balance = get_balance(user_id)
-    rec = get_budget_recommendations(balance)
-    amount = rec['max_position_usdt']
-    
-    if subtract_balance(user_id, amount):
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"✅ *ПОКУПКА ВЫПОЛНЕНА!*\n\n"
-                 f"📊 {symbol}\n"
-                 f"💰 Сумма: ${amount:.2f}\n"
-                 f"📈 Цена: ${price:,.0f}\n"
-                 f"🛑 Стоп-лосс: -{rec['stop_loss_percent']}%\n"
-                 f"🎯 Тейк-профит: +{rec['take_profit_percent']}%\n\n"
-                 f"💡 Новый баланс: ${get_balance(user_id):.2f}",
-            parse_mode='Markdown'
-        )
+    rec = get_budget_recommendations(get_balance(user_id))
+    if subtract_balance(user_id, rec['max_position_usdt']):
+        await context.bot.send_message(chat_id=user_id, text=f"✅ КУПЛЕНО!\n💰 -${rec['max_position_usdt']:.2f}\n💰 Новый баланс: ${get_balance(user_id):.2f}", parse_mode='Markdown')
     else:
-        await context.bot.send_message(chat_id=user_id, text="❌ Недостаточно средств на балансе!")
+        await context.bot.send_message(chat_id=user_id, text="❌ Недостаточно средств!")
 
 async def execute_sell(context, user_id, symbol, price):
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=f"✅ *ПРОДАЖА ВЫПОЛНЕНА!*\n\n"
-             f"📊 {symbol}\n"
-             f"📈 Цена: ${price:,.0f}\n\n"
-             f"💰 Баланс: ${get_balance(user_id):.2f}",
-        parse_mode='Markdown'
-    )
+    await context.bot.send_message(chat_id=user_id, text=f"✅ ПРОДАНО!\n💰 Баланс: ${get_balance(user_id):.2f}", parse_mode='Markdown')
 
 # ========== ФОНОВАЯ ПРОВЕРКА ==========
-async def periodic_check(application):
-    while True:
-        await asyncio.sleep(60)
-        if model.is_trained:
-            for sym in SYMBOLS:
-                try:
-                    ticker = exchange.fetch_ticker(sym)
-                    pred, conf, info = model.predict(sym)
-                    for uid in ALLOWED_USERS:
-                        await send_signal_to_user(application, uid, sym, pred, conf, info, ticker['last'])
-                    await asyncio.sleep(2)
-                except Exception as e:
-                    logger.error(f"Ошибка {sym}: {e}")
+async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
+    if not model.is_trained:
+        return
+    for sym in SYMBOLS:
+        try:
+            ticker = exchange.fetch_ticker(sym)
+            pred, conf, info = model.predict(sym)
+            for uid in ALLOWED_USERS:
+                await send_signal_to_user(context, uid, sym, pred, conf, info, ticker['last'])
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Ошибка {sym}: {e}")
 
-# ========== ОБРАБОТЧИКИ КОМАНД ==========
+# ========== ОБРАБОТЧИКИ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ALLOWED_USERS:
         await update.message.reply_text("❌ Доступ запрещён")
         return
-    
     if str(uid) not in user_balances:
         user_balances[str(uid)] = 1000
-    
-    await update.message.reply_text(
-        "🤖 *ТОРГОВЫЙ БОТ*\n\n"
-        "✅ Автосигналы раз в минуту\n"
-        "✅ 4 монеты: BTC, ETH, SOL, BNB\n"
-        "✅ Рекомендации по вашему бюджету\n"
-        "✅ Стоп-лосс и тейк-профит\n"
-        "✅ Автоторговля с защитой\n\n"
-        "👇 Выберите действие:",
-        reply_markup=get_main_keyboard(uid),
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text("🤖 *ТОРГОВЫЙ БОТ*", reply_markup=get_main_keyboard(uid), parse_mode='Markdown')
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -384,144 +286,105 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split("_")
         symbol = parts[1] + "/" + parts[2]
         price = float(parts[3])
-        await query.edit_message_text("🟢 Исполняю покупку...")
         await execute_buy(context, uid, symbol, price)
         await start(update, context)
-    
     elif data.startswith("sell_"):
         parts = data.split("_")
         symbol = parts[1] + "/" + parts[2]
         price = float(parts[3])
-        await query.edit_message_text("🔴 Исполняю продажу...")
         await execute_sell(context, uid, symbol, price)
         await start(update, context)
-    
     elif data.startswith("signal_"):
         sym = data.split("_")[1].replace("-", "/")
         if not model.is_trained:
-            await query.edit_message_text("❌ Сначала обучите модель (кнопка «Обучить»)")
+            await query.edit_message_text("❌ Сначала обучите модель!")
             return
         ticker = exchange.fetch_ticker(sym)
         pred, conf, info = model.predict(sym)
         await send_signal_to_user(context, uid, sym, pred, conf, info, ticker['last'])
         await start(update, context)
-    
     elif data == "budget":
         balance = get_balance(uid)
         rec = get_budget_recommendations(balance)
-        text = (
-            f"📊 *РЕКОМЕНДАЦИИ ПО БЮДЖЕТУ*\n\n"
-            f"💰 Ваш баланс: **${balance:.2f}**\n"
-            f"📈 Уровень: {rec['level']}\n\n"
-            f"*Стратегия:* {rec['advice']}\n\n"
-            f"*Размер позиции:* {rec['position_percent']}% = **${rec['max_position_usdt']:.2f}**\n"
-            f"*Стоп-лосс:* -{rec['stop_loss_percent']}%\n"
-            f"*Тейк-профит:* +{rec['take_profit_percent']}%\n"
-            f"*Рекомендуемые монеты:* {', '.join(rec['recommended_symbols'])}\n\n"
-            f"{rec['warning']}"
-        )
+        text = f"📊 *БЮДЖЕТ*\n💰 ${balance:.2f}\n📈 {rec['level']}\n💡 Входите ${rec['max_position_usdt']:.2f}\n🛑 Стоп: -{rec['stop_loss_percent']}%\n🎯 Профит: +{rec['take_profit_percent']}%"
         await query.edit_message_text(text, parse_mode='Markdown')
         await start(update, context)
-    
     elif data == "train":
-        await query.edit_message_text("🧠 Обучение моделей... 2-3 минуты")
+        await query.edit_message_text("🧠 Обучение... 2-3 минуты")
         res = model.train()
-        text = "✅ *Модели обучены!*\n\n"
-        for sym, r in res.items():
-            if "error" in r:
-                text += f"❌ {sym}: {r['error']}\n"
-            else:
-                text += f"✅ {sym}: точность {r['accuracy']:.2%}\n"
+        text = "✅ Обучено!\n" + "\n".join([f"{sym}: {r.get('accuracy', r.get('error'))}" for sym, r in res.items()])
         await query.edit_message_text(text, parse_mode='Markdown')
         await start(update, context)
-    
     elif data == "autotrade":
-        await query.edit_message_text("⚙️ *АВТОТОРГОВЛЯ*\nНастройки будут добавлены позже", parse_mode='Markdown')
+        await query.edit_message_text("⚙️ *АВТОТОРГОВЛЯ*", reply_markup=get_autotrade_keyboard(uid), parse_mode='Markdown')
+    elif data == "at_toggle":
+        at = get_autotrade(uid)
+        at['enabled'] = not at['enabled']
+        await query.edit_message_text(f"✅ Автоторговля {'вкл' if at['enabled'] else 'выкл'}")
+        await button_handler(update, context)
+    elif data == "at_limit_trades":
+        await query.edit_message_text("💰 Введите лимит сделок (1-20):")
+        context.user_data['waiting_trades_limit'] = uid
+    elif data == "at_limit_loss":
+        await query.edit_message_text("📉 Введите лимит убытка % (1-50):")
+        context.user_data['waiting_loss_limit'] = uid
+    elif data == "deposit_100":
+        add_balance(uid, 100)
+        await query.edit_message_text(f"✅ Пополнено! Баланс: ${get_balance(uid):.2f}")
         await start(update, context)
-    
+    elif data == "withdraw_100":
+        if subtract_balance(uid, 100):
+            await query.edit_message_text(f"✅ Выведено! Баланс: ${get_balance(uid):.2f}")
+        else:
+            await query.edit_message_text("❌ Недостаточно средств!")
+        await start(update, context)
     elif data == "balance":
-        await query.edit_message_text(f"💰 *БАЛАНС*\n💵 USDT: ${get_balance(uid):.2f}", parse_mode='Markdown')
+        await query.edit_message_text(f"💰 Баланс: ${get_balance(uid):.2f}", parse_mode='Markdown')
         await start(update, context)
-    
     elif data == "stats":
         at = get_autotrade(uid)
-        text = (
-            f"📊 *СТАТИСТИКА*\n\n"
-            f"🎯 Модель: {'✅ Обучена' if model.is_trained else '❌ Нет'}\n"
-            f"💰 Баланс: ${get_balance(uid):.2f}\n"
-            f"🤖 Автоторговля: {'✅ Вкл' if at['enabled'] else '❌ Выкл'}\n"
-            f"📊 Сделок сегодня: {at['trades_today']}/{at['max_trades_per_day']}\n"
-            f"📉 Убыток сегодня: {at['daily_loss']:.1f}%"
-        )
-        await query.edit_message_text(text, parse_mode='Markdown')
+        await query.edit_message_text(f"📊 Статистика\n🎯 Модель: {'✅' if model.is_trained else '❌'}\n💰 ${get_balance(uid):.2f}\n🤖 Автоторговля: {'✅' if at['enabled'] else '❌'}", parse_mode='Markdown')
         await start(update, context)
-    
     elif data == "tips":
-        tips = (
-            "📖 *СОВЕТЫ ПО ТОРГОВЛЕ*\n\n"
-            "1️⃣ *Управление рисками*\n"
-            "• Входите 2-5% от депозита\n"
-            "• Всегда ставьте стоп-лосс\n\n"
-            "2️⃣ *Сигналы*\n"
-            "• 🟢 ПОКУПАТЬ → входите\n"
-            "• 🔴 ПРОДАВАТЬ → фиксируйте\n"
-            "• ⏸️ ЖДАТЬ → ничего не делайте\n\n"
-            "3️⃣ *Ошибки новичков*\n"
-            "• Не усредняйте убытки\n"
-            "• Не торгуйте на эмоциях\n"
-            "• Переобучайте модель раз в сутки\n\n"
-            "⚠️ Торговля криптовалютами — высокий риск!"
-        )
-        await query.edit_message_text(tips, parse_mode='Markdown')
+        await query.edit_message_text("📖 *СОВЕТЫ*\n• Входите 2-5% от депозита\n• Всегда стоп-лосс\n• Переобучайте модель раз в сутки", parse_mode='Markdown')
+        await start(update, context)
+    elif data == "back":
         await start(update, context)
 
-async def handle_message(update, Update, context):
-    # Простой обработчик текстовых сообщений
-    pass
-
-# ========== FLASK ДЛЯ WEBHOOK ==========
-webhook_app = Flask(__name__)
-telegram_app = None
-
-@webhook_app.route(f'/{TOKEN}', methods=['POST'])
-def webhook():
-    try:
-        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return jsonify({"status": "error"}), 500
-
-@webhook_app.route('/')
-def health():
-    return jsonify({"status": "alive", "message": "Bot is running"}), 200
+async def handle_message(update, context):
+    uid = update.effective_user.id
+    if context.user_data.get('waiting_trades_limit') == uid:
+        try:
+            val = int(update.message.text)
+            if 1 <= val <= 20:
+                get_autotrade(uid)['max_trades_per_day'] = val
+                await update.message.reply_text(f"✅ Лимит: {val}")
+            else:
+                await update.message.reply_text("❌ 1-20")
+        except:
+            await update.message.reply_text("❌ Число")
+        del context.user_data['waiting_trades_limit']
+    elif context.user_data.get('waiting_loss_limit') == uid:
+        try:
+            val = float(update.message.text)
+            if 1 <= val <= 50:
+                get_autotrade(uid)['max_daily_loss'] = val
+                await update.message.reply_text(f"✅ Лимит: {val}%")
+            else:
+                await update.message.reply_text("❌ 1-50")
+        except:
+            await update.message.reply_text("❌ Число")
+        del context.user_data['waiting_loss_limit']
 
 # ========== ЗАПУСК ==========
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
 def main():
-    global telegram_app
-    
-    # Создаём приложение Telegram
-    telegram_app = Application.builder().token(TOKEN).build()
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CallbackQueryHandler(button_handler))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Запускаем фоновую проверку
-    asyncio.run_coroutine_threadsafe(periodic_check(telegram_app), loop)
-    
-    # Запускаем Flask
-    port = int(os.environ.get('PORT', 10000))
-    print("="*50)
-    print("🤖 ТОРГОВЫЙ БОТ ЗАПУЩЕН НА RENDER")
-    print(f"🌐 Webhook URL: https://your-app.onrender.com/{TOKEN}")
-    print("✅ Health check доступен по /")
-    print("="*50)
-    
-    webhook_app.run(host='0.0.0.0', port=port)
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.job_queue.run_repeating(periodic_check, interval=CHECK_INTERVAL, first=10)
+    print("🤖 БОТ ЗАПУЩЕН")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
